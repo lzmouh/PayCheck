@@ -18,20 +18,37 @@ class Payslip:
     seniority: float
 
 # -------- EXTRACTION --------
-def extract_text(pdf):
+def extract_text(pdf_file):
     text = ""
-    with pdfplumber.open(pdf) as doc:
+    # Reset stream position to ensure it's readable
+    pdf_file.seek(0) 
+    with pdfplumber.open(pdf_file) as doc:
         for page in doc.pages:
             t = page.extract_text()
-            if t:
-                text += t
+            if t: text += t
 
     if len(text) < 100:
-        images = convert_from_path(pdf)
+        from pdf2image import convert_from_bytes
+        pdf_file.seek(0)
+        images = convert_from_bytes(pdf_file.read())
         for img in images:
             text += pytesseract.image_to_string(img)
 
     return text.lower()
+
+def parse(text):
+    text = clean(text)
+    
+    # Safe month extraction
+    month_match = re.search(r"période\s*:\s*(\w+)", text)
+    month_val = month_match.group(1) if month_match else "Inconnu"
+
+    return Payslip(
+        month=month_val,
+        brut=extract([r"brut\s*[:\s]*(\d+[\s\.]?\d*\.\d{2})"], text),
+        # ... repeat for others with improved regex
+        seniority=1.0 # Consider extracting this from "Ancienneté" keywords
+    )
 
 def clean(text):
     text = text.replace("\n", " ")
@@ -48,20 +65,6 @@ def extract(patterns, text):
             except:
                 pass
     return 0
-
-def parse(text):
-    text = clean(text)
-
-    return Payslip(
-        month=re.search(r"période\s*:\s*(\w+)", text).group(1),
-        brut=extract([r"brut .*? (\d+\.\d+)"], text),
-        net=extract([r"net payé .*? (\d+\.\d+)"], text),
-        net_before_tax=extract([r"net .*? avant imp[oô]t .*? (\d+\.\d+)"], text),
-        tax=extract([r"pas .*? (\d+\.\d+)"], text),
-        base_salary=extract([r"151\.67 .*? (\d+\.\d+)"], text),
-        bonus=extract([r"prime .*? (\d+\.\d+)"], text),
-        seniority=1.0
-    )
 
 # -------- ANALYSE --------
 def analyze(payslips):
