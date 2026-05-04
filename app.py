@@ -1,8 +1,9 @@
-import pdfplumber
-import pytesseract
+import streamlit as st
+import pdfplumber, pytesseract, re
 from pdf2image import convert_from_path
-import re
 from dataclasses import dataclass
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
 
 # =========================
 # 📊 MODELE
@@ -20,35 +21,24 @@ class Payslip:
 
 
 # =========================
-# 📥 EXTRACTION TEXTE (PDF + OCR)
+# 📥 EXTRACTION
 # =========================
 def extract_text(file):
     text = ""
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                text += t
 
-    try:
-        with pdfplumber.open(file) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    text += t
-    except:
-        pass
-
-    # OCR fallback
     if len(text) < 100:
-        try:
-            images = convert_from_path(file)
-            for img in images:
-                text += pytesseract.image_to_string(img)
-        except:
-            pass
+        images = convert_from_path(file)
+        for img in images:
+            text += pytesseract.image_to_string(img)
 
     return text.lower()
 
 
-# =========================
-# 🧹 NETTOYAGE
-# =========================
 def clean(text):
     text = text.replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
@@ -56,9 +46,6 @@ def clean(text):
     return text
 
 
-# =========================
-# 🔍 EXTRACTION VALEURS
-# =========================
 def extract(patterns, text):
     for p in patterns:
         m = re.search(p, text)
@@ -66,192 +53,133 @@ def extract(patterns, text):
             try:
                 return float(m.group(1).replace(" ", ""))
             except:
-                continue
-    return 0.0
+                pass
+    return 0
 
 
-def extract_month(text):
-    m = re.search(r"période\s*:\s*(\w+)", text)
-    return m.group(1) if m else "unknown"
-
-
-def extract_seniority(text):
-    m = re.search(r"ancienneté\s*:\s*(\d+)\s*an[s]?\s*(\d+)?", text)
-    if m:
-        years = int(m.group(1))
-        months = int(m.group(2)) if m.group(2) else 0
-        return years + months / 12
-    return 0.0
-
-
-# =========================
-# 🧠 PARSING BULLETIN
-# =========================
 def parse(text):
     text = clean(text)
 
     return Payslip(
-        month=extract_month(text),
-        brut=extract([
-            r"salaire brut .*? (\d+\.\d+)",
-            r"brut .*? (\d+\.\d+)"
-        ], text),
-
-        net=extract([
-            r"net payé .*? (\d+\.\d+)",
-            r"net a payer .*? (\d+\.\d+)"
-        ], text),
-
-        net_before_tax=extract([
-            r"net .*? avant imp[oô]t .*? (\d+\.\d+)"
-        ], text),
-
-        tax=extract([
-            r"pas .*? (\d+\.\d+)",
-            r"imp[oô]t .*? (\d+\.\d+)"
-        ], text),
-
-        base_salary=extract([
-            r"151\.67 .*? (\d+\.\d+)",
-            r"salaire de base .*? (\d+\.\d+)"
-        ], text),
-
-        bonus=extract([
-            r"prime .*? (\d+\.\d+)"
-        ], text),
-
-        seniority=extract_seniority(text)
+        month=re.search(r"période\s*:\s*(\w+)", text).group(1),
+        brut=extract([r"brut .*? (\d+\.\d+)"], text),
+        net=extract([r"net payé .*? (\d+\.\d+)"], text),
+        net_before_tax=extract([r"net .*? avant imp[oô]t .*? (\d+\.\d+)"], text),
+        tax=extract([r"pas .*? (\d+\.\d+)"], text),
+        base_salary=extract([r"151\.67 .*? (\d+\.\d+)"], text),
+        bonus=extract([r"prime .*? (\d+\.\d+)"], text),
+        seniority=1.0
     )
 
 
 # =========================
-# 👀 DEBUG AFFICHAGE
-# =========================
-def show(p):
-    print(f"\n--- {p.month.upper()} ---")
-    print(f"Brut: {p.brut}")
-    print(f"Net avant impôt: {p.net_before_tax}")
-    print(f"Impôt: {p.tax}")
-    print(f"Net payé: {p.net}")
-    print(f"Salaire base: {p.base_salary}")
-    print(f"Prime: {p.bonus}")
-    print(f"Ancienneté: {round(p.seniority, 2)}")
-
-
-# =========================
-# 🧠 ANALYSE METIER
+# 🧠 ANALYSE
 # =========================
 def analyze(payslips):
-    results = {
-        "coherence": [],
-        "chronology": [],
-        "financial": [],
-        "risk_flags": []
-    }
-
-    # Chronologie
-    for i in range(1, len(payslips)):
-        if payslips[i].seniority < payslips[i-1].seniority:
-            results["chronology"].append("Ancienneté incohérente")
-
-    # Calculs
-    for p in payslips:
-        if abs((p.net_before_tax - p.tax) - p.net) > 5:
-            results["financial"].append(f"Incohérence calcul net ({p.month})")
-
-    # Variation
-    for i in range(1, len(payslips)):
-        prev = payslips[i-1]
-        curr = payslips[i]
-
-        if prev.brut == curr.brut and prev.net != curr.net:
-            results["coherence"].append("Variation incohérente")
-
-    # Prime suspecte
-    bonuses = [p.bonus for p in payslips]
-    if len(set(bonuses)) == 1 and bonuses[0] > 0:
-        results["risk_flags"].append("Prime constante suspecte")
-
-    return results
-
-
-# =========================
-# 📊 SCORING
-# =========================
-def compute_score(results):
-
-    weights = {
-        "coherence": 3,
-        "chronology": 3,
-        "financial": 3,
-        "risk_flags": 1
-    }
-
+    issues = []
     score = 10
 
-    for section, issues in results.items():
-        score -= len(issues) * weights[section] * 0.5
+    for i in range(1, len(payslips)):
+        if payslips[i].seniority < payslips[i-1].seniority:
+            issues.append("Ancienneté incohérente")
+            score -= 2
+
+    for p in payslips:
+        if abs((p.net_before_tax - p.tax) - p.net) > 5:
+            issues.append(f"Incohérence calcul net ({p.month})")
+            score -= 2
+
+    for i in range(1, len(payslips)):
+        if payslips[i].brut == payslips[i-1].brut and payslips[i].net != payslips[i-1].net:
+            issues.append("Variation incohérente")
+            score -= 2
+
+    bonuses = [p.bonus for p in payslips]
+    if len(set(bonuses)) == 1 and bonuses[0] > 0:
+        issues.append("Prime suspecte constante")
+        score -= 1
 
     score = max(score, 0)
 
     if score >= 8:
-        grade = "A - Fiable"
-    elif score >= 6:
-        grade = "B - Acceptable"
-    elif score >= 4:
-        grade = "C - Risqué"
+        reco = "Validation"
+    elif score >= 5:
+        reco = "Vérification complémentaire"
     else:
-        grade = "D - Refus"
+        reco = "Refus dossier"
 
-    return score, grade
+    return issues, score, reco
 
 
 # =========================
-# 📄 RAPPORT
+# 📄 RAPPORT PDF
 # =========================
-def generate_report(results, score, grade):
-    print("\n===== RAPPORT D'ANALYSE =====")
+def generate_pdf(issues, score, reco):
+    file_path = "/mnt/data/rapport_analyse.pdf"
+    doc = SimpleDocTemplate(file_path)
+    styles = getSampleStyleSheet()
 
-    for section, issues in results.items():
-        print(f"\n[{section.upper()}]")
-        if issues:
-            for i in issues:
-                print("-", i)
-        else:
-            print("OK")
+    content = []
+    content.append(Paragraph("Rapport d'analyse des bulletins de paie", styles["Title"]))
+    content.append(Spacer(1, 12))
 
-    print("\nScore :", round(score, 2), "/10")
-    print("Classe :", grade)
+    content.append(Paragraph(f"Score: {score}/10", styles["Normal"]))
+    content.append(Paragraph(f"Recommandation: {reco}", styles["Normal"]))
+    content.append(Spacer(1, 12))
 
-    if grade.startswith("A"):
-        print("Recommandation : ✅ Validation")
-    elif grade.startswith("B"):
-        print("Recommandation : ⚠️ Vérification complémentaire")
+    content.append(Paragraph("Anomalies détectées :", styles["Heading2"]))
+
+    if issues:
+        for i in issues:
+            content.append(Paragraph(f"- {i}", styles["Normal"]))
     else:
-        print("Recommandation : ❌ Refus dossier")
+        content.append(Paragraph("Aucune anomalie", styles["Normal"]))
+
+    doc.build(content)
+
+    return file_path
 
 
 # =========================
-# 🚀 MAIN
+# 🖥️ UI STREAMLIT
 # =========================
-if __name__ == "__main__":
+st.title("🔎 Analyse de bulletins de paie (outil pro)")
 
-    files = [
-        "CAMARA MOHAMED FEVRIER.pdf",
-        "CAMARA MOHAMED MARS (1).pdf",
-        "CAMARA MOHAMED AVRIL.pdf"
-    ]
+files = st.file_uploader("Importer les PDF", type="pdf", accept_multiple_files=True)
 
+if files:
     payslips = []
 
-    for f in files:
-        print(f"\nLecture : {f}")
-        text = extract_text(f)
+    for file in files:
+        text = extract_text(file)
         p = parse(text)
-        show(p)
+
+        st.subheader(p.month)
+        st.write(vars(p))
+
         payslips.append(p)
 
-    results = analyze(payslips)
-    score, grade = compute_score(results)
+    if st.button("Analyser le dossier"):
 
-    generate_report(results, score, grade)
+        issues, score, reco = analyze(payslips)
+
+        st.divider()
+        st.subheader("Résultat")
+
+        st.write(f"Score : {score}/10")
+        st.write(f"Recommandation : {reco}")
+
+        st.write("Anomalies :")
+        for i in issues:
+            st.write("-", i)
+
+        # Génération PDF
+        pdf_path = generate_pdf(issues, score, reco)
+
+        with open(pdf_path, "rb") as f:
+            st.download_button(
+                label="📄 Télécharger le rapport PDF",
+                data=f,
+                file_name="rapport_analyse.pdf",
+                mime="application/pdf"
+            )
