@@ -6,163 +6,162 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 import pandas as pd
+from Levenshtein import ratio
 
-# -------- DATA --------
+# -------- DATA STRUCTURE --------
 @dataclass
 class Payslip:
-    month: str
+    filename: str
+    month_str: str
     date_obj: datetime
-    brut: float
-    net: float
-    net_avant_impot: float
-    impot: float
+    siret: str
+    adresse_emp: str
+    statut: str
     salaire_base: float
-    heures: float
-    conges_pris: float
+    brut: float
+    net_paye: float
+    net_avant_impot: float
+    impot_pas: float
+    prev_sociale: float # Total cotisations
+    cumul_brut: float
+    cumul_net_imposable: float
     prime: float
-    anciennete_str: str  # Original text from PDF
-    anciennete_val: float # Numeric for calculation
+    anciennete_mois: int
+    date_paiement: datetime
 
-MONTH_MAP = {
-    "janvier": 1, "février": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6,
-    "juillet": 7, "août": 8, "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12
-}
-
-# -------- EXTRACTION --------
-def extract_text(pdf_file):
-    pdf_file.seek(0)
-    text = ""
-    with pdfplumber.open(pdf_file) as doc:
-        for page in doc.pages:
-            t = page.extract_text()
-            if t: text += t
-
-    if len(text.strip()) < 100:
-        pdf_file.seek(0)
-        images = convert_from_bytes(pdf_file.read())
-        for img in images:
-            text += pytesseract.image_to_string(img)
-    return text.lower()
-
-def clean(text):
-    text = text.replace("\n", " ")
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"(\d),(\d{2})", r"\1.\2", text) # Commas to dots for math
-    return text
-
-def extract_value(patterns, text):
+# -------- EXTRACTION ENGINE --------
+def extract_value(patterns, text, is_float=True):
     for p in patterns:
         m = re.search(p, text)
         if m:
             try:
-                val = m.group(1).replace(" ", "").replace("o", "0")
-                return float(val)
+                raw = m.group(1).replace(" ", "").replace(",", ".")
+                return float(raw) if is_float else m.group(1).strip()
             except: continue
-    return 0.0
+    return 0.0 if is_float else ""
 
-def parse(text):
-    cleaned_text = clean(text)
+def parse_payslip(file):
+    file.seek(0)
+    text = ""
+    with pdfplumber.open(file) as doc:
+        for page in doc.pages:
+            t = page.extract_text()
+            if t: text += t
     
-    # Date extraction
-    month_match = re.search(r"(janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)", cleaned_text)
-    year_match = re.search(r"20\d{2}", cleaned_text)
-    m_str = month_match.group(0) if month_match else "inconnu"
-    y_int = int(year_match.group(0)) if year_match else datetime.now().year
-    date_obj = datetime(y_int, MONTH_MAP.get(m_str, 1), 1)
-
-    # Heures & Congés (Common French Payslip Keywords)
-    heures = extract_value([r"heures\s*travaillees\s*(\d+[\s\.]?\d*)", r"(\d+\.\d{2})\s*h\s*normales"], cleaned_text)
-    if heures == 0: heures = 151.67 # Default French legal month
+    if len(text) < 100:
+        file.seek(0)
+        images = convert_from_bytes(file.read())
+        text = "".join([pytesseract.image_to_string(img) for img in images])
     
-    conges = extract_value([r"conges\s*pris\s*(\d+[\s\.]?\d*)", r"nb\s*jours\s*pris\s*(\d+[\s\.]?\d*)"], cleaned_text)
+    clean_text = text.lower().replace("\n", " ")
+    
+    # Date & Period
+    months = ["janvier","février","mars","avril","mai","juin","juillet","août","septembre","octobre","novembre","décembre"]
+    m_match = re.search(r"(?P<m>"+ "|".join(months) + r")\s*(?P<y>20\d{2})", clean_text)
+    date_obj = datetime(int(m_match.group('y')), months.index(m_match.group('m'))+1, 1) if m_match else datetime.now()
 
-    # Seniority (Extracting the date or the year count)
-    anc_match = re.search(r"anciennet[ée]\s*[:\-]?\s*(\d{2}/\d{2}/\d{4}|\d+\s*ans?)", cleaned_text)
-    anc_str = anc_match.group(1) if anc_match else "Non détecté"
+    # Payment Date
+    pay_match = re.search(r"payé\s*le\s*(\d{2}/\d{2}/\d{4})", clean_text)
+    pay_date = datetime.strptime(pay_match.group(1), "%d/%m/%Y") if pay_match else None
 
     return Payslip(
-        month=f"{m_str.capitalize()} {y_int}",
+        filename=file.name,
+        month_str=m_match.group(0) if m_match else "Inconnu",
         date_obj=date_obj,
-        brut=extract_value([r"total brut.*?(\d+[\s\.]?\d*\.\d{2})", r"salaire brut.*?(\d+[\s\.]?\d*\.\d{2})"], cleaned_text),
-        net=extract_value([r"net payé.*?(\d+[\s\.]?\d*\.\d{2})", r"net à payer.*?(\d+[\s\.]?\d*\.\d{2})"], cleaned_text),
-        net_avant_impot=extract_value([r"net avant imp[oô]t.*?(\d+[\s\.]?\d*\.\d{2})"], cleaned_text),
-        impot=extract_value([r"imp[oô]t.*?(\d+[\s\.]?\d*\.\d{2})", r"pas.*?(\d+[\s\.]?\d*\.\d{2})"], cleaned_text),
-        salaire_base=extract_value([r"salaire de base.*?(\d+[\s\.]?\d*\.\d{2})"], cleaned_text),
-        heures=heures,
-        conges_pris=conges,
-        prime=extract_value([r"prime.*?(\d+[\s\.]?\d*\.\d{2})"], cleaned_text),
-        anciennete_str=anc_str,
-        anciennete_val=0.0 # Will be extrapolated later
+        siret=extract_value([r"siret\s*[:\s]*(\d{14})", r"(\d{3}\s\d{3}\s\d{3}\s\d{5})"], clean_text, False),
+        adresse_emp=extract_value([r"employeur\s*:(.*?)(?=siret|code|$)"], clean_text, False),
+        statut=extract_value([r"statut\s*[:\s]*(.*?)(?=coefficient|échelon|$)"], clean_text, False),
+        salaire_base=extract_value([r"salaire\s*de\s*base\s*(\d+[\s\.,]\d{2})"], clean_text),
+        brut=extract_value([r"total\s*brut\s*(\d+[\s\.,]\d{2})"], clean_text),
+        net_paye=extract_value([r"net\s*payé\s*(\d+[\s\.,]\d{2})", r"net\s*à\s*payer\s*(\d+[\s\.,]\d{2})"], clean_text),
+        net_avant_impot=extract_value([r"net\s*avant\s*imp[oô]t\s*(\d+[\s\.,]\d{2})"], clean_text),
+        impot_pas=extract_value([r"imp[oô]t\s*sur\s*le\s*revenu\s*(\d+[\s\.,]\d{2})", r"pas\s*(\d+[\s\.,]\d{2})"], clean_text),
+        prev_sociale=extract_value([r"total\s*des\s*cotisations\s*(\d+[\s\.,]\d{2})"], clean_text),
+        cumul_brut=extract_value([r"cumul\s*brut\s*(\d+[\s\.,]\d{2})"], clean_text),
+        cumul_net_imposable=extract_value([r"cumul\s*net\s*imposable\s*(\d+[\s\.,]\d{2})"], clean_text),
+        prime=extract_value([r"prime\s*exceptionnelle\s*(\d+[\s\.,]\d{2})", r"prime\s*de\s*rendement\s*(\d+[\s\.,]\d{2})"], clean_text),
+        anciennete_mois=int(extract_value([r"anciennet[ée]\s*:\s*(\d+)\s*mois"], clean_text)),
+        date_paiement=pay_date
     )
 
-# -------- UI & LOGIC --------
-st.set_page_config(page_title="Audit Paie AI", layout="wide")
-st.title("🔎 Expert Audit de Bulletins de Paie")
+# -------- PROFESSIONAL AUDIT ENGINE --------
+def run_audit(payslips):
+    ps = sorted(payslips, key=lambda x: x.date_obj)
+    reports = []
+    total_score = 10
+    
+    # 1. Identity & Employer Verification
+    if len(set([p.siret for p in ps])) > 1:
+        reports.append(("❌ SIRET Incohérent", "Le numéro SIRET change d'un mois à l'autre.", "MAJEUR"))
+        total_score -= 3
+    
+    for i in range(1, len(ps)):
+        if ratio(ps[i].adresse_emp, ps[i-1].adresse_emp) < 0.8:
+            reports.append(("⚠️ Adresse Employeur", f"Variation d'adresse suspecte entre {ps[i-1].month_str} et {ps[i].month_str}.", "MINEUR"))
+            total_score -= 1
 
-files = st.file_uploader("Charger les bulletins (PDF)", type="pdf", accept_multiple_files=True)
-
-if files:
-    data_list = []
-    for f in files:
-        with st.spinner(f"Lecture de {f.name}..."):
-            data_list.append(parse(extract_text(f)))
-
-    if data_list:
-        # Create DataFrame and Sort
-        df = pd.DataFrame([vars(p) for p in data_list])
-        df = df.sort_values("date_obj")
-
-        # 1. Extrapolate Cumulative Data
-        df['Brut Cumulé'] = df['brut'].cumsum()
-        df['Heures Cumulées'] = df['heures'].cumsum()
-        df['Congés Cumulés'] = df['conges_pris'].cumsum()
-        
-        # 2. Refine Table for Display (French Names)
-        display_df = df.rename(columns={
-            'month': 'Période',
-            'brut': 'Salaire Brut (€)',
-            'net': 'Net à Payer (€)',
-            'net_avant_impot': 'Net Avant Impôt (€)',
-            'impot': 'Impôt (PAS) (€)',
-            'salaire_base': 'Salaire de Base (€)',
-            'heures': 'Heures Travaillées',
-            'conges_pris': 'Congés Pris (J)',
-            'prime': 'Primes (€)',
-            'anciennete_str': 'Ancienneté (Doc)'
-        })
-
-        # Select columns to show
-        cols_to_show = [
-            'Période', 'Salaire de Base (€)', 'Salaire Brut (€)', 'Brut Cumulé', 
-            'Net à Payer (€)', 'Heures Travaillées', 'Heures Cumulées', 
-            'Congés Pris (J)', 'Congés Cumulés', 'Ancienneté (Doc)'
-        ]
-        
-        st.subheader("📊 Tableau Récapitulatif et Cumuls")
-        st.dataframe(display_df[cols_to_show], use_container_width=True, hide_index=True)
-
-        # 3. Enhanced Visualization
-        st.divider()
-        st.subheader("📈 Visualisation des Tendances")
-        
-        tab1, tab2 = st.tabs(["Salaires & Cumuls", "Temps de Travail & Congés"])
-        
-        with tab1:
-            # Multi-line chart for financial data
-            st.line_chart(df.set_index('month')[['brut', 'net', 'Brut Cumulé']])
+    # 2. Chronology & Payment Logic
+    for p in ps:
+        if p.date_paiement and p.date_paiement.month == p.date_obj.month and p.date_paiement.day < 25:
+            reports.append(("❌ Date de Paiement Illogique", f"Paiement le {p.date_paiement.day} pour le mois de {p.month_str}.", "MAJEUR"))
+            total_score -= 2
             
-        with tab2:
-            # Bar chart for hours and leave
-            st.bar_chart(df.set_index('month')[['heures', 'conges_pris']])
-            st.write("**Évolution des Heures Cumulées**")
-            st.line_chart(df.set_index('month')['Heures Cumulées'])
+    for i in range(1, len(ps)):
+        if ps[i].anciennete_mois <= ps[i-1].anciennete_mois:
+             reports.append(("❌ Ancienneté Incohérente", f"L'ancienneté n'augmente pas entre {ps[i-1].month_str} et {ps[i].month_str}.", "MAJEUR"))
+             total_score -= 3
 
-        # Simple Consistency Check for the UI
-        if len(df) > 1:
-            st.divider()
-            st.subheader("🔍 Analyse de Cohérence")
-            diff_brut = df['brut'].iloc[-1] - df['brut'].iloc[0]
-            if diff_brut != 0:
-                st.warning(f"Variation de salaire brut détectée sur la période : {diff_brut:+.2f}€")
-            else:
-                st.success("Salaire brut stable sur la période analysée.")
+    # 3. Math Consistency (Brut -> Net)
+    for p in ps:
+        theorique_net = p.net_avant_impot - p.impot_pas
+        if abs(theorique_net - p.net_paye) > 0.05:
+            reports.append(("❌ Erreur de Calcul Net", f"Calcul Net/PAS faux sur {p.month_str}.", "MAJEUR"))
+            total_score -= 4
+
+    # 4. YTD / Cumuls (The "Fatal" Test)
+    for i in range(1, len(ps)):
+        if ps[i].cumul_brut <= ps[i-1].cumul_brut:
+            reports.append(("❌ Cumul Annuel Bloqué", f"Le cumul brut de {ps[i].month_str} n'est pas supérieur à {ps[i-1].month_str}.", "CRITIQUE"))
+            total_score -= 5
+
+    # 5. Suspicious Repetitions ("Too Perfect")
+    if len(ps) > 1:
+        if len(set([p.brut for p in ps])) == 1 and len(set([p.net_paye for p in ps])) > 1:
+            reports.append(("❌ Brut constant / Net variable", "Mathématiquement impossible si les cotisations sont fixes.", "CRITIQUE"))
+            total_score -= 4
+        if len(set([p.prime for p in ps])) == 1 and ps[0].prime > 0:
+            reports.append(("⚠️ Prime Suspecte", "Prime identique répétée sans aucune variation.", "MINEUR"))
+            total_score -= 1
+
+    return reports, max(0, total_score)
+
+# -------- UI --------
+st.set_page_config(page_title="Audit Expert Paie", layout="wide")
+st.title("🛡️ Audit Professionnel de Documents de Paie")
+
+uploaded_files = st.file_uploader("Fichiers PDF", accept_multiple_files=True)
+
+if uploaded_files:
+    extracted_data = [parse_payslip(f) for f in uploaded_files]
+    anomalies, score = run_audit(extracted_data)
+    
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.metric("SCORE DE FIABILITÉ", f"{score}/10")
+        if score >= 8: st.success("Dossier Conforme")
+        elif score >= 5: st.warning("Dossier Douteux")
+        else: st.error("Dossier NON FIABLE / REJET")
+        
+        st.write("### Détail des Anomalies")
+        for title, msg, severity in anomalies:
+            color = "red" if severity in ["MAJEUR", "CRITIQUE"] else "orange"
+            st.markdown(f"**<span style='color:{color}'>{title}</span>** : {msg}", unsafe_allow_html=True)
+
+    with col2:
+        df = pd.DataFrame([vars(p) for p in extracted_data]).sort_values("date_obj")
+        st.write("### Données pour Vérification Manuelle")
+        st.dataframe(df[['month_str', 'siret', 'salaire_base', 'brut', 'net_paye', 'cumul_brut', 'anciennete_mois']])
+        
+        st.write("### Graphique de Cohérence des Cumuls")
+        st.line_chart(df.set_index('month_str')[['cumul_brut', 'cumul_net_imposable']])
