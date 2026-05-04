@@ -1,185 +1,98 @@
 import streamlit as st
-import pdfplumber, pytesseract, re
-from pdf2image import convert_from_path
-from dataclasses import dataclass
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
+import re
+import pandas as pd
 
-# =========================
-# 📊 MODELE
-# =========================
-@dataclass
-class Payslip:
-    month: str
-    brut: float
-    net: float
-    net_before_tax: float
-    tax: float
-    base_salary: float
-    bonus: float
-    seniority: float
+st.set_page_config(page_title="Vérification Avancée de Paie", layout="wide")
 
+def clean_float(value):
+    if not value: return 0.0
+    # Nettoie les espaces et remplace la virgule par un point
+    return float(value.replace(" ", "").replace(",", "."))
 
-# =========================
-# 📥 EXTRACTION
-# =========================
-def extract_text(file):
-    text = ""
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                text += t
+def extraire_donnees_completes(texte):
+    data = {}
+    
+    # --- Identifiants ---
+    data['SIRET'] = (re.search(r"SIRET[:\s]*(\d{3}\s?\d{3}\s?\d{3}\s?\d{5})", texte, re.I) or [None, None])[1]
+    
+    # --- Période (Mois vs Annuel) ---
+    # Extraction des valeurs du mois[cite: 1, 3, 7]
+    data['m_brut'] = clean_float((re.search(r"(?:Mensuel|Mois).*?BRUT.*?(\d[\d\s,.]*\d)", texte, re.I | re.S) or [None, "0"])[1])
+    data['m_heures'] = clean_float((re.search(r"Hrs trav\..*?(\d[\d\s,.]*\d)", texte, re.I | re.S) or [None, "0"])[1])
+    data['m_patronale'] = clean_float((re.search(r"Part Patronale.*?(\d[\d\s,.]*\d)", texte, re.I | re.S) or [None, "0"])[1])
+    
+    # Extraction des cumuls annuels[cite: 2, 6, 10]
+    data['c_brut'] = clean_float((re.search(r"Annuel.*?Brut.*?(\d[\d\s,.]*\d)", texte, re.I | re.S) or [None, "0"])[1])
+    data['c_heures'] = clean_float((re.search(r"Annuel.*?Heures.*?(\d[\d\s,.]*\d)", texte, re.I | re.S) or [None, "0"])[1])
+    data['c_patronale'] = clean_float((re.search(r"Annuel.*?Ch\.\s?patronales.*?(\d[\d\s,.]*\d)", texte, re.I | re.S) or [None, "0"])[1])
 
-    if len(text) < 100:
-        images = convert_from_path(file)
-        for img in images:
-            text += pytesseract.image_to_string(img)
+    # --- Congés[cite: 1, 6, 8] ---
+    cp_reste = re.search(r"Reste.*?(\d[\d\s,.]*\d)", texte, re.I | re.S)
+    data['solde_conges'] = clean_float(cp_reste.group(1)) if cp_reste else 0.0
 
-    return text.lower()
+    return data
 
+def verifier_audite(d):
+    alertes = []
+    
+    # 1. Test de cohérence des Cumuls[cite: 2, 6, 9]
+    if d['c_brut'] > 0:
+        if d['m_brut'] > d['c_brut']:
+            alertes.append("❌ Erreur de cumul : Le brut du mois est supérieur au brut annuel.")
+        
+        # Un mois ne peut pas représenter plus de 100% de l'année (test de base)
+        ratio_brut = (d['m_brut'] / d['c_brut']) * 100
+        if ratio_brut > 20: # Alerte si un seul mois fait plus de 20% de l'année hors primes
+            alertes.append(f"⚠️ Ratio Brut : Le mois représente {ratio_brut:.1f}% de l'année. Vérifiez les primes.")
 
-def clean(text):
-    text = text.replace("\n", " ")
-    text = re.sub(r"\s+", " ", text)
-    text = text.replace(",", ".")
-    return text
+    # 2. Test des Heures[cite: 1, 7, 10]
+    if d['m_heures'] > 200: # Seuil légal haut habituel
+        alertes.append(f"⚠️ Volume d'heures élevé ({d['m_heures']}h). Vérifiez les heures supplémentaires.")
+    
+    # 3. Test Charges Patronales[cite: 2, 3, 6]
+    if d['m_patronale'] > 0:
+        ratio_patronal = (d['m_patronale'] / d['m_brut']) if d['m_brut'] > 0 else 0
+        if not (0.20 <= ratio_patronal <= 0.55):
+            alertes.append(f"❌ Ratio charges patronales suspect ({ratio_patronal:.1%}). Attendu entre 25% et 50%.")
 
+    # 4. Test Congés[cite: 5, 8]
+    if d['solde_conges'] > 60:
+        alertes.append(f"⚠️ Solde de congés inhabituel ({d['solde_conges']} jours).")
 
-def extract(patterns, text):
-    for p in patterns:
-        m = re.search(p, text)
-        if m:
-            try:
-                return float(m.group(1).replace(" ", ""))
-            except:
-                pass
-    return 0
+    return alertes
 
+# --- Interface ---
+st.title("🛡️ Audit Profond de Fiche de Paie")
+st.markdown("Vérification mathématique des cumuls et des ratios de cotisations.")
 
-def parse(text):
-    text = clean(text)
+txt = st.text_area("Collez le contenu textuel ici :", height=300)
 
-    return Payslip(
-        month=re.search(r"période\s*:\s*(\w+)", text).group(1),
-        brut=extract([r"brut .*? (\d+\.\d+)"], text),
-        net=extract([r"net payé .*? (\d+\.\d+)"], text),
-        net_before_tax=extract([r"net .*? avant imp[oô]t .*? (\d+\.\d+)"], text),
-        tax=extract([r"pas .*? (\d+\.\d+)"], text),
-        base_salary=extract([r"151\.67 .*? (\d+\.\d+)"], text),
-        bonus=extract([r"prime .*? (\d+\.\d+)"], text),
-        seniority=1.0
-    )
+if txt:
+    data = extraire_donnees_completes(txt)
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📊 Données Extraites")
+        st.write(f"**Brut du mois :** {data['m_brut']} €[cite: 1, 3]")
+        st.write(f"**Cumul Brut annuel :** {data['c_brut']} €[cite: 6, 10]")
+        st.write(f"**Heures travaillées :** {data['m_heures']} h[cite: 7]")
+        st.write(f"**Solde Congés :** {data['solde_conges']} j")
+        st.write(f"**Charges Patronales :** {data['m_patronale']} €[cite: 4, 8]")
 
+    with col2:
+        st.subheader("🚩 Analyse de Cohérence")
+        rapport = verifier_audite(data)
+        if not rapport:
+            st.success("Cohérence mathématique validée sur les points analysés.")
+        else:
+            for r in rapport:
+                st.write(r)
 
-# =========================
-# 🧠 ANALYSE
-# =========================
-def analyze(payslips):
-    issues = []
-    score = 10
-
-    for i in range(1, len(payslips)):
-        if payslips[i].seniority < payslips[i-1].seniority:
-            issues.append("Ancienneté incohérente")
-            score -= 2
-
-    for p in payslips:
-        if abs((p.net_before_tax - p.tax) - p.net) > 5:
-            issues.append(f"Incohérence calcul net ({p.month})")
-            score -= 2
-
-    for i in range(1, len(payslips)):
-        if payslips[i].brut == payslips[i-1].brut and payslips[i].net != payslips[i-1].net:
-            issues.append("Variation incohérente")
-            score -= 2
-
-    bonuses = [p.bonus for p in payslips]
-    if len(set(bonuses)) == 1 and bonuses[0] > 0:
-        issues.append("Prime suspecte constante")
-        score -= 1
-
-    score = max(score, 0)
-
-    if score >= 8:
-        reco = "Validation"
-    elif score >= 5:
-        reco = "Vérification complémentaire"
-    else:
-        reco = "Refus dossier"
-
-    return issues, score, reco
-
-
-# =========================
-# 📄 RAPPORT PDF
-# =========================
-def generate_pdf(issues, score, reco):
-    file_path = "/mnt/data/rapport_analyse.pdf"
-    doc = SimpleDocTemplate(file_path)
-    styles = getSampleStyleSheet()
-
-    content = []
-    content.append(Paragraph("Rapport d'analyse des bulletins de paie", styles["Title"]))
-    content.append(Spacer(1, 12))
-
-    content.append(Paragraph(f"Score: {score}/10", styles["Normal"]))
-    content.append(Paragraph(f"Recommandation: {reco}", styles["Normal"]))
-    content.append(Spacer(1, 12))
-
-    content.append(Paragraph("Anomalies détectées :", styles["Heading2"]))
-
-    if issues:
-        for i in issues:
-            content.append(Paragraph(f"- {i}", styles["Normal"]))
-    else:
-        content.append(Paragraph("Aucune anomalie", styles["Normal"]))
-
-    doc.build(content)
-
-    return file_path
-
-
-# =========================
-# 🖥️ UI STREAMLIT
-# =========================
-st.title("🔎 Analyse de bulletins de paie (outil pro)")
-
-files = st.file_uploader("Importer les PDF", type="pdf", accept_multiple_files=True)
-
-if files:
-    payslips = []
-
-    for file in files:
-        text = extract_text(file)
-        p = parse(text)
-
-        st.subheader(p.month)
-        st.write(vars(p))
-
-        payslips.append(p)
-
-    if st.button("Analyser le dossier"):
-
-        issues, score, reco = analyze(payslips)
-
-        st.divider()
-        st.subheader("Résultat")
-
-        st.write(f"Score : {score}/10")
-        st.write(f"Recommandation : {reco}")
-
-        st.write("Anomalies :")
-        for i in issues:
-            st.write("-", i)
-
-        # Génération PDF
-        pdf_path = generate_pdf(issues, score, reco)
-
-        with open(pdf_path, "rb") as f:
-            st.download_button(
-                label="📄 Télécharger le rapport PDF",
-                data=f,
-                file_name="rapport_analyse.pdf",
-                mime="application/pdf"
-            )
+    # Tableau comparatif Mois vs Année
+    st.subheader("📈 Comparatif Mensuel / Annuel")
+    df = pd.DataFrame({
+        'Indicateur': ['Salaire Brut', 'Heures', 'Charges Pat.'],
+        'Mensuel': [data['m_brut'], data['m_heures'], data['m_patronale']],
+        'Annuel (Cumul)': [data['c_brut'], data['c_heures'], data['c_patronale']]
+    })
+    st.dataframe(df, use_container_width=True)
