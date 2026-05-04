@@ -2,94 +2,86 @@ import streamlit as st
 import pdfplumber
 import re
 import pandas as pd
+from datetime import datetime
 
-st.set_page_config(page_title="Audit PDF de Paie", layout="wide")
+st.set_page_config(page_title="Audit Intégrité Paie", layout="wide")
 
-def extract_data_from_pdf(file):
-    """Extrait le texte et tente de structurer les tableaux du PDF."""
-    full_text = ""
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            # Extraction du texte brut
-            text = page.extract_text()
-            if text:
-                full_text += text + "\n"
-    return full_text
+# --- Fonctions d'Extraction ---
+def extract_all_data(files):
+    all_records = []
+    months_map = {
+        'janvier': 1, 'février': 2, 'mars': 3, 'avril': 4, 'mai': 5, 'juin': 6,
+        'juillet': 7, 'août': 8, 'septembre': 9, 'octobre': 10, 'novembre': 11, 'décembre': 12
+    }
 
-def clean_val(value):
-    if not value: return 0.0
-    # Nettoyage des caractères non numériques courants dans les PDFs
-    cleaned = re.sub(r"[^\d,.-]", "", str(value)).replace(",", ".")
-    try:
-        return float(cleaned)
-    except ValueError:
-        return 0.0
+    for file in files:
+        with pdfplumber.open(file) as pdf:
+            text = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
+            
+            # Extraction de la période[cite: 3, 7, 10]
+            date_match = re.search(r"Période[:\s]*([A-Za-zûé]+)\s+(\202\d)", text, re.I)
+            month_str = date_match.group(1).lower() if date_match else "inconnu"
+            year = int(date_match.group(2)) if date_match else 2026
+            month_num = months_map.get(month_str, 0)
 
-def analyser_contenu(texte):
-    res = {}
-    # Extraction SIRET (14 chiffres)[cite: 1, 3]
-    siret = re.search(r"SIRET[:\s]*(\d{3}\s?\d{3}\s?\d{3}\s?\d{5})", texte, re.I)
-    res['siret'] = siret.group(1).replace(" ", "") if siret else "Non détecté"
-
-    # Extraction des montants (Mois vs Cumuls)[cite: 3, 6, 10]
-    # Utilisation de patterns flexibles pour s'adapter aux différents formats (DINDY, BOULANGERIE, etc.)
-    res['brut_mois'] = clean_val((re.search(r"SALAIRE BRUT.*?(\d[\d\s,.]*\d)", texte, re.I | re.S) or [None, "0"])[1])
-    res['brut_annuel'] = clean_val((re.search(r"Annuel.*?Brut.*?(\d[\d\s,.]*\d)", texte, re.I | re.S) or [None, "0"])[1])
+            # Extraction des valeurs financières[cite: 1, 6, 9]
+            record = {
+                "Fichier": file.name,
+                "Mois_Num": month_num,
+                "Période": f"{month_str.capitalize()} {year}",
+                "Brut_Mois": clean_val(re.search(r"SALAIRE BRUT.*?(\d[\d\s,.]*\d)", text, re.I | re.S)),
+                "Brut_Cumul": clean_val(re.search(r"Annuel.*?Brut.*?(\d[\d\s,.]*\d)", text, re.I | re.S)),
+                "Net_Payé": clean_val(re.search(r"NET\s+(?:PAYÉ|A\s+PAYER).*?(\d[\d\s,.]*\d)", text, re.I | re.S)),
+                "Congés_Acquis": clean_val(re.search(r"Acquis.*?(\d[\d\s,.]*\d)", text, re.I | re.S)),
+                "Congés_Solde": clean_val(re.search(r"Solde.*?(\d[\d\s,.]*\d)|Reste.*?(\d[\d\s,.]*\d)", text, re.I | re.S))
+            }
+            all_records.append(record)
     
-    # Net à payer[cite: 1, 2, 7]
-    net_paye = re.search(r"NET\s+PAYÉ.*?(\d[\d\s,.]*\d)|NET\s+A\s+PAYER.*?(\d[\d\s,.]*\d)", texte, re.I | re.S)
-    res['net_paye'] = clean_val(net_paye.group(1) or net_paye.group(2)) if net_paye else 0.0
+    # Tri par ordre chronologique[cite: 2, 9]
+    return sorted(all_records, key=lambda x: x['Mois_Num'])
 
-    # Heures et Congés[cite: 1, 6, 8]
-    heures = re.search(r"Hrs trav\..*?(\d[\d\s,.]*\d)|Heures.*?(\d[\d\s,.]*\d)", texte, re.I | re.S)
-    res['heures'] = clean_val(heures.group(1) or heures.group(2)) if heures else 0.0
-    
-    conges = re.search(r"Reste.*?(\d[\d\s,.]*\d)|Solde.*?(\d[\d\s,.]*\d)", texte, re.I | re.S)
-    res['conges'] = clean_val(conges.group(1) or conges.group(2)) if conges else 0.0
-
-    return res
+def clean_val(match):
+    if not match: return 0.0
+    val = match.group(1) if match.groups() else match.group(0)
+    return float(re.sub(r"[^\d,.-]", "", str(val)).replace(",", "."))
 
 # --- Interface Streamlit ---
-st.title("🛡️ Vérificateur Officiel de Bulletins de Paie (PDF)")
-st.write("Téléchargez un bulletin (ex: Fichier2.pdf, CAMARA MOHAMED FEVRIER.pdf) pour vérification.")
+st.title("🛡️ Audit de Cohérence Multi-Bulletins")
+st.write("Téléchargez plusieurs mois pour vérifier l'intégrité de la progression des revenus et des congés.")
 
-uploaded_file = st.file_uploader("Choisir un fichier PDF", type="pdf")
+uploaded_files = st.file_uploader("Téléchargez vos PDFs (ex: Janvier, Février, Mars...)", type="pdf", accept_multiple_files=True)
 
-if uploaded_file:
-    with st.spinner('Extraction des données en cours...'):
-        texte_extrait = extract_data_from_pdf(uploaded_file)
-        data = analyser_contenu(texte_extrait)
-        
-    col1, col2 = st.columns([1, 1])
+if uploaded_files:
+    data = extract_all_data(uploaded_files)
+    df = pd.DataFrame(data)
+    
+    st.subheader("📋 Récapitulatif Chronologique")
+    st.dataframe(df.drop(columns=['Mois_Num']), use_container_width=True)
 
-    with col1:
-        st.subheader("📄 Données du Bulletin")
-        st.info(f"**SIRET Employeur :** {data['siret']}[cite: 1, 9]")
-        st.metric("Salaire Brut (Mois)", f"{data['brut_mois']} €")
-        st.metric("Net Payé", f"{data['net_paye']} €")
-        st.write(f"**Heures détectées :** {data['heures']} h[cite: 7]")
-        st.write(f"**Solde Congés :** {data['conges']} jours[cite: 1, 6]")
-
-    with col2:
-        st.subheader("🚩 Analyse d'Authenticité")
-        
-        # Test 1 : Cohérence Net/Brut[cite: 1, 4]
-        if data['brut_mois'] > 0:
-            ratio = data['net_paye'] / data['brut_mois']
-            if ratio > 0.9:
-                st.error(f"❌ Ratio Net/Brut suspect ({ratio:.1%}). Le net est trop proche du brut.")
-            elif ratio < 0.6:
-                st.warning(f"⚠️ Ratio Net/Brut faible ({ratio:.1%}). Vérifiez les saisies ou absences.")
+    st.subheader("🔍 Analyse de l'Intégrité")
+    
+    if len(data) > 1:
+        for i in range(1, len(data)):
+            prev = data[i-1]
+            curr = data[i]
+            
+            st.markdown(f"**Comparaison : {prev['Période']} ➡️ {curr['Période']}**")
+            
+            # 1. Vérification mathématique du cumul Brut[cite: 6, 9]
+            attendu = prev['Brut_Cumul'] + curr['Brut_Mois']
+            diff = abs(curr['Brut_Cumul'] - attendu)
+            
+            if diff < 2.0: # Tolérance pour arrondis
+                st.success(f"✅ Intégrité du cumul Brut validée ({curr['Brut_Cumul']} €).")
             else:
-                st.success(f"✅ Ratio Net/Brut cohérent ({ratio:.1%}).")
-
-        # Test 2 : Vérification du Cumul
-        if data['brut_annuel'] > 0 and data['brut_mois'] > data['brut_annuel']:
-            st.error("❌ Alerte Cumul : Le salaire du mois est supérieur au total annuel déclaré.")
-        
-        # Test 3 : Format SIRET[cite: 3, 9]
-        if data['siret'] != "Non détecté" and len(data['siret']) != 14:
-            st.warning("⚠️ Le numéro SIRET extrait ne semble pas valide (14 chiffres attendus).")
-
-    with st.expander("Voir le texte brut extrait du PDF"):
-        st.text(texte_extrait)
+                st.error(f"❌ Rupture de cumul détectée ! Attendu: {attendu} €, Trouvé: {curr['Brut_Cumul']} €.")
+            
+            # 2. Vérification de la progression des congés[cite: 1, 6, 10]
+            if curr['Congés_Solde'] < prev['Congés_Solde'] and curr['Congés_Solde'] > 0:
+                st.info(f"ℹ️ Diminution du solde de congés (Prise de congés probable).")
+            elif curr['Congés_Solde'] == prev['Congés_Solde']:
+                st.warning(f"⚠️ Le solde de congés n'a pas bougé entre les deux mois.")
+                
+            st.divider()
+    else:
+        st.info("Téléchargez au moins deux bulletins pour activer l'analyse de progression.")
